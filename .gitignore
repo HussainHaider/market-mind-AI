@@ -4,3 +4,19 @@
 
 # LangGraph
 .langgraph_api/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets / local config
+.env
+
+# SQLite thread memory
+*.db
+marketmind.db
+
+# Gradio
+.gradio/

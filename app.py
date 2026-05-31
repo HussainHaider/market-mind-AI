@@ -7,6 +7,7 @@ human-in-the-loop approval panel for sensitive actions (stock purchases).
 from __future__ import annotations
 
 import uuid
+import warnings
 from typing import List, Optional, Tuple
 
 import gradio as gr
@@ -16,7 +17,79 @@ from langgraph.types import Command
 from marketmind import config
 from marketmind.graph import get_app, list_threads
 
+# Gradio 5.50 emits forward-looking 6.0 deprecation notices that we cannot avoid
+# while keeping the current, intended behaviour:
+#   * ``theme`` must still be passed to the Blocks constructor (``launch(theme=...)``
+#     is not supported yet in 5.50).
+#   * ``allow_tags`` warns whenever it is not ``True`` — even when explicitly set to
+#     ``False`` — but we deliberately keep HTML tags disabled.
+for _msg in (
+    r".*'theme' parameter in the Blocks constructor.*",
+    r".*default value of 'allow_tags' in gr\.Chatbot.*",
+):
+    warnings.filterwarnings("ignore", message=_msg, category=DeprecationWarning)
+
 APP = get_app()
+
+# ---------------------------------------------------------------------------
+# Styling
+# ---------------------------------------------------------------------------
+CUSTOM_CSS = """
+.gradio-container { max-width: 100% !important; }
+
+/* Sidebar conversation list should span the full column width */
+#thread-list, #thread-list .wrap { width: 100% !important; }
+#thread-list .wrap label {
+    display: flex !important;
+    width: 100% !important;
+    box-sizing: border-box;
+}
+
+/* Chat column is a vertical flex so the composer hugs the bottom */
+#chat-col { display: flex; flex-direction: column; }
+
+/* Header: title on the left, theme picker pinned to the top-right */
+#header-row { flex-wrap: nowrap !important; align-items: flex-start; }
+#app-title { flex: 1 1 auto; min-width: 0 !important; }
+#theme-dd {
+    flex: 0 0 auto !important;
+    margin-left: auto !important;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Themes
+# ---------------------------------------------------------------------------
+# Gradio bakes the theme at ``Blocks`` build time, so true runtime switching is
+# done by overriding the theme's CSS variables with a later ``<style>`` block.
+# We build each theme once, precompute its variable CSS, and inject every theme's
+# font stylesheets up front so a switched-to theme still renders with its font.
+DEFAULT_THEME_NAME = "Default"
+THEMES = {
+    "Terminal": gr.Theme.from_hub("hmb/terminal"),
+    "Monochrome": gr.themes.Monochrome(),
+    "Default": gr.themes.Default(),
+}
+THEME_CSS = {name: theme._get_theme_css() for name, theme in THEMES.items()}
+
+
+def _font_links_html() -> str:
+    """Collect the external font stylesheets across all themes (deduped)."""
+    seen: set = set()
+    links: List[str] = []
+    for theme in THEMES.values():
+        for sheet in getattr(theme, "_stylesheets", []) or []:
+            if not sheet or sheet in seen:
+                continue
+            seen.add(sheet)
+            href = f"https:{sheet}" if sheet.startswith("//") else sheet
+            links.append(f'<link rel="stylesheet" href="{href}">')
+    return "\n".join(links)
+
+
+def _theme_style(name: str) -> str:
+    return f"<style>{THEME_CSS.get(name, '')}</style>"
 
 
 # ---------------------------------------------------------------------------
@@ -200,12 +273,31 @@ def build_ui() -> gr.Blocks:
         "(keyword routing + template responses). Set the key in `.env` for full LLM reasoning."
     )
 
-    with gr.Blocks(title="MarketMind AI", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(
+        title="MarketMind AI",
+        theme=THEMES[DEFAULT_THEME_NAME],
+        fill_height=True,
+    ) as demo:
+        gr.HTML(f"<style>{CUSTOM_CSS}</style>", padding=False)
+        gr.HTML(_font_links_html(), padding=False)
+        theme_style = gr.HTML(_theme_style(DEFAULT_THEME_NAME), padding=False)
         thread_state = gr.State(initial_thread)
         threads_state = gr.State(thread_choices)
         tips_visible = gr.State(False)
 
-        gr.Markdown("# MarketMind AI\nA multi-agent financial research assistant.")
+        with gr.Row(equal_height=False, elem_id="header-row"):
+            gr.Markdown(
+                "# MarketMind AI\nA multi-agent financial research assistant.",
+                elem_id="app-title",
+            )
+            theme_dd = gr.Dropdown(
+                label="Theme",
+                choices=list(THEMES.keys()),
+                value=DEFAULT_THEME_NAME,
+                interactive=True,
+                min_width=160,
+                elem_id="theme-dd",
+            )
         if banner:
             gr.Markdown(banner)
 
@@ -216,7 +308,7 @@ def build_ui() -> gr.Blocks:
             "- *Buy 10 shares of MSFT*"
         )
 
-        with gr.Row():
+        with gr.Row(equal_height=False):
             with gr.Column(scale=1, min_width=240):
                 with gr.Row():
                     new_btn = gr.Button("New chat", variant="primary", scale=5)
@@ -227,10 +319,17 @@ def build_ui() -> gr.Blocks:
                     choices=_thread_choices(thread_choices),
                     value=initial_thread,
                     interactive=True,
+                    elem_id="thread-list",
                 )
 
-            with gr.Column(scale=4):
-                chatbot = gr.Chatbot(type="messages", height=460, label="MarketMind")
+            with gr.Column(scale=4, elem_id="chat-col"):
+                chatbot = gr.Chatbot(
+                    type="messages",
+                    label="MarketMind",
+                    allow_tags=False,
+                    scale=1,
+                    height="70vh",
+                )
 
                 with gr.Group(visible=False) as approval_group:
                     approval_md = gr.Markdown("")
@@ -286,6 +385,8 @@ def build_ui() -> gr.Blocks:
             [tips_visible],
             [tips_md, tips_visible],
         )
+
+        theme_dd.change(_theme_style, [theme_dd], [theme_style])
 
     return demo
 

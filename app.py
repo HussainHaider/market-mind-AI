@@ -38,6 +38,17 @@ def _pending_interrupt(thread_id: str) -> Optional[dict]:
     return None
 
 
+def _thread_choices(threads: List[str]) -> List[Tuple[str, str]]:
+    """Build (label, value) pairs so the thread list shows short, readable names.
+
+    Newest conversation first (creation-order numbering is preserved).
+    """
+    labels: List[Tuple[str, str]] = []
+    for i, tid in enumerate(threads, start=1):
+        labels.append((f"Chat {i} · {str(tid)[:8]}…", tid))
+    return list(reversed(labels))
+
+
 def _messages_to_history(messages) -> List[dict]:
     history = []
     for msg in messages:
@@ -86,7 +97,11 @@ def _stream_synthesis(payload, history: List[dict], thread_id: str):
     routing tokens never leak into the chat. Mirrors the ``stream_mode="messages"``
     approach used in the omnichat Streamlit frontend.
     """
-    history = history + [{"role": "assistant", "content": ""}]
+    # Show an immediate placeholder so the user gets feedback while the LLM /
+    # tools run, before the first streamed token arrives.
+    history = history + [{"role": "assistant", "content": "_Thinking…_"}]
+    yield history, None
+
     acc = ""
     streamed = False
     try:
@@ -140,13 +155,22 @@ def on_decision(decision: str, history: List[dict], thread_id: str):
         yield history, *_approval_update(pending)
 
 
+def on_approve(history: List[dict], thread_id: str):
+    yield from on_decision("yes", history, thread_id)
+
+
+def on_decline(history: List[dict], thread_id: str):
+    yield from on_decision("no", history, thread_id)
+
+
 def on_new_chat(threads: List[str]):
     tid = str(uuid.uuid4())
     threads = (threads or []) + [tid]
     return (
         tid,
+        threads,
         [],
-        gr.update(choices=threads, value=tid),
+        gr.update(choices=_thread_choices(threads), value=tid),
         *_approval_update(None),
     )
 
@@ -179,25 +203,30 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="MarketMind AI", theme=gr.themes.Soft()) as demo:
         thread_state = gr.State(initial_thread)
         threads_state = gr.State(thread_choices)
+        tips_visible = gr.State(False)
 
         gr.Markdown("# MarketMind AI\nA multi-agent financial research assistant.")
         if banner:
             gr.Markdown(banner)
 
+        tips_text = (
+            "**Try asking:**\n"
+            "- *What's the price and risk for AAPL?*\n"
+            "- *Latest news sentiment on Tesla*\n"
+            "- *Buy 10 shares of MSFT*"
+        )
+
         with gr.Row():
-            with gr.Column(scale=1, min_width=220):
-                new_btn = gr.Button("New chat", variant="primary")
-                thread_dd = gr.Dropdown(
+            with gr.Column(scale=1, min_width=240):
+                with gr.Row():
+                    new_btn = gr.Button("New chat", variant="primary", scale=5)
+                    info_btn = gr.Button("ⓘ", scale=1, min_width=44)
+                tips_md = gr.Markdown(tips_text, visible=False)
+                thread_list = gr.Radio(
                     label="Conversation threads",
-                    choices=thread_choices,
+                    choices=_thread_choices(thread_choices),
                     value=initial_thread,
                     interactive=True,
-                )
-                gr.Markdown(
-                    "**Try:**\n"
-                    "- *What's the price and risk for AAPL?*\n"
-                    "- *Latest news sentiment on Tesla*\n"
-                    "- *Buy 10 shares of MSFT*"
                 )
 
             with gr.Column(scale=4):
@@ -231,12 +260,12 @@ def build_ui() -> gr.Blocks:
         )
 
         approve_btn.click(
-            lambda h, t: on_decision("yes", h, t),
+            on_approve,
             [chatbot, thread_state],
             [chatbot, *approval_outputs],
         )
         decline_btn.click(
-            lambda h, t: on_decision("no", h, t),
+            on_decline,
             [chatbot, thread_state],
             [chatbot, *approval_outputs],
         )
@@ -244,12 +273,18 @@ def build_ui() -> gr.Blocks:
         new_btn.click(
             on_new_chat,
             [threads_state],
-            [thread_state, chatbot, thread_dd, *approval_outputs],
+            [thread_state, threads_state, chatbot, thread_list, *approval_outputs],
         )
-        thread_dd.change(
+        thread_list.change(
             lambda tid: (tid, *on_load_thread(tid)),
-            [thread_dd],
+            [thread_list],
             [thread_state, chatbot, *approval_outputs],
+        )
+
+        info_btn.click(
+            lambda visible: (gr.update(visible=not visible), not visible),
+            [tips_visible],
+            [tips_md, tips_visible],
         )
 
     return demo

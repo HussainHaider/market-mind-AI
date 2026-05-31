@@ -11,9 +11,6 @@ prebuilt **`ToolNode`**, an **OpenAI** LLM (with a full offline fallback), a
 external API tools, and a **SQLite-backed checkpointer** for persistent,
 multi-turn conversation memory.
 
-> Built for the *LangChain + LangGraph — Agentic AI Application* assignment. The
-> section headings below map 1:1 to the required README deliverables.
-
 ---
 
 ## 1. Project title
@@ -47,9 +44,6 @@ exact capabilities the assignment asks for.
 | `compute_risk_metrics` | **Custom Python** | Volatility, Sharpe, drawdown, risk level |
 | `score_sentiment` | **Custom Python** | Lexicon-based sentiment over text |
 | `purchase_stock` | **Custom Python** (HITL) | Simulated order; `interrupt`s for approval |
-
-This satisfies the requirement of **≥3 tools, ≥2 external-API tools and ≥1 custom
-Python tool**.
 
 ## 4. APIs integrated
 
@@ -243,18 +237,6 @@ APIs → SQLite memory → final response).
 | `marketmind/agents.py` | Graph nodes + conditional-routing functions |
 | `marketmind/graph.py` | Graph wiring, `ToolNode`, SQLite checkpointer |
 | `app.py` | Gradio frontend (chat, threads, approval panel, activity panel) |
-
----
-
-## Bonus features implemented
-
-- **Multi-agent + supervisor workflow** — a Supervisor routes to specialised
-  stock / news / trade sub-flows.
-- **Human-in-the-loop approval** — `interrupt`-based gate before any trade.
-- **Database integration** — SQLite-backed checkpointer for thread memory.
-- **LangSmith tracing** — `@traceable` helpers + env config for full run
-  observability.
-- **Streaming responses** — token-level streaming into the Gradio chat.
 
 ---
 

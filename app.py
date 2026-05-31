@@ -143,6 +143,35 @@ def _latest_answer(thread_id: str) -> str:
     return ""
 
 
+def _activity_md(thread_id: str) -> str:
+    """Summarise the agent's reasoning + tool/API usage for the latest turn.
+
+    Surfaces the Supervisor's routing decision, the extracted ticker and the
+    tools/APIs actually executed — so the UI visibly demonstrates *why* the
+    agent did what it did and *which* tools ran (assignment Steps 5 & 6).
+    """
+    try:
+        vals = APP.get_state(_config(thread_id)).values
+    except Exception:
+        return "_No activity yet — ask a question to see the agent's routing and tool usage._"
+
+    routes = vals.get("routes") or []
+    if not routes or routes == ["chat"]:
+        return "**Detected intent:** `chat` — handled directly, _no tools or external APIs were called for this turn._"
+
+    lines = ["**Detected intent:** " + ", ".join(f"`{r}`" for r in routes)]
+    if vals.get("ticker"):
+        lines.append(f"**Ticker:** `{vals['ticker']}`")
+    if vals.get("quantity"):
+        lines.append(f"**Quantity:** `{vals['quantity']}`")
+    tools_used = vals.get("tool_history") or []
+    if tools_used:
+        lines.append("**Tools / APIs called:** " + ", ".join(f"`{t}`" for t in tools_used))
+    if _pending_interrupt(thread_id):
+        lines.append("**Status:** ⏸ paused — awaiting human approval")
+    return "\n\n".join(lines)
+
+
 def _approval_update(payload: Optional[dict]):
     """Build component updates for the approval panel."""
     if payload:
@@ -209,23 +238,23 @@ def _stream_synthesis(payload, history: List[dict], thread_id: str):
 def on_submit(user_msg: str, history: List[dict], thread_id: str):
     user_msg = (user_msg or "").strip()
     if not user_msg:
-        yield history, "", *_approval_update(None)
+        yield history, "", *_approval_update(None), gr.update()
         return
 
     history = (history or []) + [{"role": "user", "content": user_msg}]
-    yield history, "", *_approval_update(None)
+    yield history, "", *_approval_update(None), gr.update(value="_Working…_")
 
     payload = {"messages": [HumanMessage(content=user_msg)]}
     pending = None
     for history, pending in _stream_synthesis(payload, history, thread_id):
-        yield history, "", *_approval_update(pending)
+        yield history, "", *_approval_update(pending), _activity_md(thread_id)
 
 
 def on_decision(decision: str, history: List[dict], thread_id: str):
     history = history or []
     pending = None
     for history, pending in _stream_synthesis(Command(resume=decision), history, thread_id):
-        yield history, *_approval_update(pending)
+        yield history, *_approval_update(pending), _activity_md(thread_id)
 
 
 def on_approve(history: List[dict], thread_id: str):
@@ -245,18 +274,19 @@ def on_new_chat(threads: List[str]):
         [],
         gr.update(choices=_thread_choices(threads), value=tid),
         *_approval_update(None),
+        _activity_md(tid),
     )
 
 
 def on_load_thread(thread_id: str):
     if not thread_id:
-        return [], *_approval_update(None)
+        return [], *_approval_update(None), _activity_md("")
     try:
         state = APP.get_state(_config(thread_id))
         history = _messages_to_history(state.values.get("messages", []))
     except Exception:
         history = []
-    return history, *_approval_update(_pending_interrupt(thread_id))
+    return history, *_approval_update(_pending_interrupt(thread_id)), _activity_md(thread_id)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +367,12 @@ def build_ui() -> gr.Blocks:
                         approve_btn = gr.Button("Approve", variant="primary")
                         decline_btn = gr.Button("Decline", variant="stop")
 
+                with gr.Accordion("Agent activity (routing & tools)", open=False):
+                    activity_md = gr.Markdown(
+                        "_No activity yet — ask a question to see the agent's "
+                        "routing and tool usage._"
+                    )
+
                 with gr.Row():
                     txt = gr.Textbox(
                         placeholder="Ask about a stock, news sentiment, or risk…",
@@ -350,34 +386,34 @@ def build_ui() -> gr.Blocks:
         send_btn.click(
             on_submit,
             [txt, chatbot, thread_state],
-            [chatbot, txt, *approval_outputs],
+            [chatbot, txt, *approval_outputs, activity_md],
         )
         txt.submit(
             on_submit,
             [txt, chatbot, thread_state],
-            [chatbot, txt, *approval_outputs],
+            [chatbot, txt, *approval_outputs, activity_md],
         )
 
         approve_btn.click(
             on_approve,
             [chatbot, thread_state],
-            [chatbot, *approval_outputs],
+            [chatbot, *approval_outputs, activity_md],
         )
         decline_btn.click(
             on_decline,
             [chatbot, thread_state],
-            [chatbot, *approval_outputs],
+            [chatbot, *approval_outputs, activity_md],
         )
 
         new_btn.click(
             on_new_chat,
             [threads_state],
-            [thread_state, threads_state, chatbot, thread_list, *approval_outputs],
+            [thread_state, threads_state, chatbot, thread_list, *approval_outputs, activity_md],
         )
         thread_list.change(
             lambda tid: (tid, *on_load_thread(tid)),
             [thread_list],
-            [thread_state, chatbot, *approval_outputs],
+            [thread_state, chatbot, *approval_outputs, activity_md],
         )
 
         info_btn.click(

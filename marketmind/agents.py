@@ -16,8 +16,9 @@ import json
 import re
 from functools import lru_cache
 from typing import List, Optional
+from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from . import config, tools
 from .state import AgentState
@@ -249,18 +250,48 @@ def news_agent(state: AgentState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Purchase Stock Flow (human-in-the-loop happens inside the tool)
+# Purchase Stock Flow (canonical agent -> ToolNode pattern, with HITL)
 # ---------------------------------------------------------------------------
-def purchase_agent(state: AgentState) -> dict:
+# This flow demonstrates the standard LangGraph tool-calling loop:
+#   trader (emits a tool call) --> trade_tools (ToolNode executes it) --> trade_collect
+# The ``purchase_stock`` tool pauses the graph via ``interrupt`` for human
+# approval, so the ToolNode itself is the human-in-the-loop gate. We drive it
+# through a private ``trade_messages`` channel so the raw tool-call / tool-result
+# messages never appear in the user-facing chat transcript.
+def trader(state: AgentState) -> dict:
+    """LLM/agent step that decides to call the ``purchase_stock`` tool.
+
+    Produces an ``AIMessage`` carrying a ``tool_call`` — exactly what a
+    ``ToolNode`` consumes. When no ticker is present we emit no tool call, so
+    the conditional edge routes straight past the ToolNode.
+    """
     if "buy" not in state.get("routes", []):
-        return {}  # passthrough
+        return {}  # passthrough: this flow was not selected
     ticker = state.get("ticker")
     quantity = state.get("quantity") or 1
     if not ticker:
         return {"purchase": {"status": "error", "message": "no ticker to purchase"}}
-    result = tools.purchase_stock.invoke({"symbol": ticker, "quantity": quantity})
-    history = list(state.get("tool_history", [])) + ["purchase_stock"]
-    return {"purchase": result, "tool_history": history}
+
+    tool_call = {
+        "name": "purchase_stock",
+        "args": {"symbol": ticker, "quantity": quantity},
+        "id": f"buy_{uuid4().hex[:8]}",
+    }
+    return {"trade_messages": [AIMessage(content="", tool_calls=[tool_call])]}
+
+
+def trade_collect(state: AgentState) -> dict:
+    """Lift the ToolNode's ``ToolMessage`` result back into typed state."""
+    for msg in reversed(state.get("trade_messages", [])):
+        if isinstance(msg, ToolMessage):
+            raw = msg.content
+            try:
+                data = raw if isinstance(raw, dict) else json.loads(raw)
+            except Exception:
+                data = {"status": "info", "message": str(raw)}
+            history = list(state.get("tool_history", [])) + ["purchase_stock"]
+            return {"purchase": data, "tool_history": history}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -395,3 +426,50 @@ def approval_gate(state: AgentState) -> dict:
 
 def approval_decision(state: AgentState) -> str:
     return "revise" if state.get("revision_notes") else "approve"
+
+
+# ---------------------------------------------------------------------------
+# Conditional routing (dynamic node selection)
+# ---------------------------------------------------------------------------
+# Instead of running every flow node and gating each one internally, the graph
+# uses these functions on ``add_conditional_edges`` to *skip* straight to the
+# next workflow the supervisor actually selected. This is the assignment's
+# "when the model decides a tool is needed, route there" behaviour: a request
+# for only news jumps past the stock + risk + trade nodes entirely, while a
+# pure greeting ("chat") skips every tool and goes straight to the synthesizer.
+#
+# The order is a deterministic skip-chain (stocks -> news -> buy -> processing),
+# which gives genuine conditional routing without the fan-in races that uneven
+# parallel branches can cause.
+def route_from_supervisor(state: AgentState) -> str:
+    routes = state.get("routes", [])
+    if "stocks" in routes:
+        return "stock_fetcher"
+    if "news" in routes:
+        return "news_agent"
+    if "buy" in routes:
+        return "trader"
+    return "response_synthesizer"  # chat / out-of-scope: no tools needed
+
+
+def route_after_stocks(state: AgentState) -> str:
+    routes = state.get("routes", [])
+    if "news" in routes:
+        return "news_agent"
+    if "buy" in routes:
+        return "trader"
+    return "processing"
+
+
+def route_after_news(state: AgentState) -> str:
+    if "buy" in state.get("routes", []):
+        return "trader"
+    return "processing"
+
+
+def route_after_trader(state: AgentState) -> str:
+    """Route to the ToolNode only when a tool call was actually emitted."""
+    msgs = state.get("trade_messages", [])
+    if msgs and getattr(msgs[-1], "tool_calls", None):
+        return "trade_tools"
+    return "processing"

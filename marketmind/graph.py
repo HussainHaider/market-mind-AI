@@ -1,39 +1,120 @@
-"""Assemble the MarketMind workflow graph with SQLite thread memory.
-
-Topology — the Supervisor classifies the request, then **conditional edges**
-dynamically route to only the workflows that are needed (a deterministic
-skip-chain ``stocks -> news -> buy -> processing``). Unneeded flows are skipped
-entirely instead of being run-then-gated::
-
-    START
-      -> supervisor
-           --cond--> stock_fetcher -> risk_calculator   (Stock Analysis Flow)
-           --cond--> news_agent                         (News Analysis Flow)
-           --cond--> trader -> trade_tools (ToolNode)    (Purchase Flow, HITL)
-                              -> trade_collect
-           --cond--> response_synthesizer               ("chat": no tools)
-      (active flows converge) -> processing -> state_updater
-           -> response_synthesizer
-           -> approval_gate --(approve)--> END
-                            --(revise)---> response_synthesizer
-
-The purchase flow follows the canonical *agent -> ToolNode* loop: ``trader``
-emits a tool call, the prebuilt :class:`~langgraph.prebuilt.ToolNode` executes
-``purchase_stock`` (which ``interrupt``s for human approval), and the result is
-lifted back into state by ``trade_collect``.
-"""
-
 from __future__ import annotations
 
 import sqlite3
 from functools import lru_cache
 
+from langchain_core.messages import SystemMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_openai import ChatOpenAI
 
 from . import agents, config, tools
-from .state import AgentState
+from .state import AgentState, SubAgentState
+
+# === Multi-agent architecture scaffold ===
+# Each sub-agent will be a compiled sub-graph with its own LLM and tools.
+# The orchestrator LLM will call these as tools.
+
+# --- LLM instances for each agent (can share model name, but separate objects) ---
+stock_llm = ChatOpenAI(model=config.OPENAI_MODEL, temperature=0)
+news_llm = ChatOpenAI(model=config.OPENAI_MODEL, temperature=0)
+trade_llm = ChatOpenAI(model=config.OPENAI_MODEL, temperature=0)
+chat_llm = ChatOpenAI(model=config.OPENAI_MODEL, temperature=0)
+orch_llm = ChatOpenAI(model=config.OPENAI_MODEL, temperature=0)
+
+# --- Tool bindings for each agent ---
+stock_tools = tools.STOCK_TOOLS
+news_tools = tools.NEWS_TOOLS
+trade_tools = tools.TRADE_TOOLS
+chat_tools = []
+
+# --- bind tools to each agent's LLM ---
+stock_llm_with_tools = stock_llm.bind_tools(stock_tools)
+news_llm_with_tools = news_llm.bind_tools(news_tools)
+trade_llm_with_tools = trade_llm.bind_tools(trade_tools)
+chat_llm_with_tools = chat_llm.bind_tools(chat_tools)
+
+
+# --- build the stock analyst sub-graph ---
+def stock_agent_node(state):
+    return {"messages": [stock_llm_with_tools.invoke(state["messages"])]}
+
+
+stock_graph = StateGraph(SubAgentState)
+stock_graph.add_node("agent",  stock_agent_node)
+stock_graph.add_node("tools",  ToolNode(stock_tools))
+
+stock_graph.add_edge(START, "agent")
+
+stock_graph.add_conditional_edges("agent", tools_condition)
+stock_graph.add_edge("tools", "agent")
+stock_graph.add_edge("agent", END)
+stock_agent = stock_graph.compile()
+
+
+# Wrap each sub-graph as a callable tool
+stock_tool = stock_agent.as_tool(
+    name="stock_analyst",
+    description="Fetches price, fundamentals, and risk metrics for a ticker. Input: ticker symbol."
+)
+
+orch_llm_with_tools = orch_llm.bind_tools([stock_tool])  # Add other sub-agent tools as they are implemented
+
+def orchestrator_node(state: AgentState):
+    system = SystemMessage(content="""You are a financial research orchestrator.
+    Given the user's request, decide which specialist agents to call.
+    You may call multiple agents in sequence. Return their combined results.""")
+    response = orch_llm_with_tools.invoke([system] + state["messages"])
+    return {"messages": [response]}
+
+# Main graph is now just: orchestrator → ToolNode(sub-agents) → synthesizer
+main_graph = StateGraph(AgentState)
+main_graph.add_node("orchestrator",  orchestrator_node)
+main_graph.add_node("agent_tools",   ToolNode([stock_tool]))
+main_graph.add_node("synthesizer",   response_synthesizer_node)
+main_graph.add_node("approval_gate", approval_gate_node)
+
+main_graph.add_edge(START, "orchestrator")
+main_graph.add_edge("orchestrator", "agent_tools")
+main_graph.add_edge("agent_tools", "synthesizer")
+main_graph.add_edge("synthesizer", "approval_gate")
+main_graph.add_conditional_edges(
+    "approval_gate",
+    agents.approval_decision,
+    {"approve": END, "revise": "synthesizer"},
+)
+
+# --- Sub-graph placeholders (to be implemented) ---
+# def stock_agent_node(state): ...
+# def news_agent_node(state): ...
+# def trade_agent_node(state): ...
+# def chat_agent_node(state): ...
+#
+# stock_graph = ...
+# news_graph = ...
+# trade_graph = ...
+# chat_graph = ...
+#
+# stock_tool = ...
+# news_tool = ...
+# trade_tool = ...
+# chat_tool = ...
+
+# --- Orchestrator node placeholder (to be implemented) ---
+# def orchestrator_node(state): ...
+
+# --- Main graph wiring (to be implemented) ---
+# main_graph = StateGraph(AgentState)
+# main_graph.add_node("orchestrator", orchestrator_node)
+# main_graph.add_node("agent_tools", ToolNode([stock_tool, news_tool, trade_tool, chat_tool]))
+# main_graph.add_node("synthesizer", agents.response_synthesizer)
+# main_graph.add_node("approval_gate", agents.approval_gate)
+# main_graph.set_entry_point("orchestrator")
+# main_graph.add_conditional_edges("orchestrator", tools_condition)
+# main_graph.add_edge("agent_tools", "orchestrator")
+# main_graph.add_conditional_edges("orchestrator", lambda s: "synthesizer" if ... else "agent_tools")
+# ...
 
 
 def build_graph(checkpointer=None):

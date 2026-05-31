@@ -473,3 +473,8 @@ def route_after_trader(state: AgentState) -> str:
     if msgs and getattr(msgs[-1], "tool_calls", None):
         return "trade_tools"
     return "processing"
+
+
+# --- build the stock analyst sub-graph ---
+def stock_agent_node(state):
+    return {"messages": [stock_llm_with_tools.invoke(state["messages"])]}

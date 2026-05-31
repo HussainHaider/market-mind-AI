@@ -309,7 +309,7 @@ def purchase_stock(symbol: str, quantity: int) -> dict:
 
 
 # Convenience groupings used by the graph.
-STOCK_TOOLS = [get_stock_price, get_stock_fundamentals, get_fx_rate]
-NEWS_TOOLS = [search_headlines, analyze_news_sentiment]
+STOCK_TOOLS = [get_stock_price, get_stock_fundamentals, compute_risk_metrics]
+NEWS_TOOLS = [search_headlines, analyze_news_sentiment, get_fx_rate]
 TRADE_TOOLS = [purchase_stock]
 ALL_TOOLS = STOCK_TOOLS + NEWS_TOOLS + TRADE_TOOLS

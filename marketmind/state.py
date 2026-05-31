@@ -6,6 +6,7 @@ from typing import Annotated, Any, List, Optional, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+from langgraph.graph import MessagesState
 
 
 class AgentState(TypedDict, total=False):
@@ -17,11 +18,6 @@ class AgentState(TypedDict, total=False):
 
     # Conversation history (auto-merged by LangGraph).
     messages: Annotated[List[BaseMessage], add_messages]
-
-    # A *private* message channel used only to drive the trade ``ToolNode``.
-    # Keeping it separate from ``messages`` means the internal tool-call /
-    # tool-result exchange never leaks into the user-facing chat transcript.
-    trade_messages: Annotated[List[BaseMessage], add_messages]
 
     # The latest user query, lifted out of ``messages`` by the supervisor.
     query: str
@@ -53,3 +49,8 @@ class AgentState(TypedDict, total=False):
     # Human Approval Gate bookkeeping.
     needs_approval: bool
     revision_notes: str
+
+# Minimal state for each sub-agent graph (sub-graphs use only messages)
+class SubAgentState(MessagesState):
+    """Minimal state for each sub-agent graph. Only 'messages' is needed."""
+    pass

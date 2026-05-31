@@ -18,6 +18,11 @@ class AgentState(TypedDict, total=False):
     # Conversation history (auto-merged by LangGraph).
     messages: Annotated[List[BaseMessage], add_messages]
 
+    # A *private* message channel used only to drive the trade ``ToolNode``.
+    # Keeping it separate from ``messages`` means the internal tool-call /
+    # tool-result exchange never leaks into the user-facing chat transcript.
+    trade_messages: Annotated[List[BaseMessage], add_messages]
+
     # The latest user query, lifted out of ``messages`` by the supervisor.
     query: str
 

@@ -11,6 +11,7 @@ keyword heuristics and the response synthesiser falls back to a template.
 
 from __future__ import annotations
 
+from langchain_openai import ChatOpenAI
 import json
 import re
 from functools import lru_cache
@@ -29,7 +30,6 @@ def get_llm():
     """Return a configured ChatOpenAI instance, or ``None`` when offline."""
     if not config.has_openai():
         return None
-    from langchain_openai import ChatOpenAI
 
     return ChatOpenAI(model=config.OPENAI_MODEL, temperature=0)
 
@@ -79,22 +79,41 @@ def extract_quantity(text: str) -> Optional[int]:
     return None
 
 
+_BUY_KEYWORDS = ["buy", "purchase", "acquire", "invest in"]
+_STOCK_KEYWORDS = [
+    "price", "stock", "share", "market cap", "p/e", "pe ratio", "volume",
+    "valuation", "fundamental", "risk", "volatility", "fx", "exchange rate",
+]
+_NEWS_KEYWORDS = ["news", "sentiment", "headline", "analyst", "earnings", "outlook"]
+_FINANCE_KEYWORDS = _BUY_KEYWORDS + _STOCK_KEYWORDS + _NEWS_KEYWORDS
+
+
+def _is_financial(text: str) -> bool:
+    """Whether a query is actually about markets/finance.
+
+    Used as a cheap gate so greetings, small-talk and out-of-scope ("garbage")
+    input skip the LLM router and all the network-bound tools entirely.
+    """
+    if not text or not text.strip():
+        return False
+    lowered = text.lower()
+    if any(kw in lowered for kw in _FINANCE_KEYWORDS):
+        return True
+    return extract_ticker(text) is not None
+
+
 def _keyword_routes(text: str) -> List[str]:
     lowered = text.lower()
     routes: List[str] = []
-    if any(w in lowered for w in ["buy", "purchase", "acquire", "invest in"]):
+    if any(w in lowered for w in _BUY_KEYWORDS):
         routes.append("buy")
-    if any(
-        w in lowered
-        for w in ["price", "stock", "share", "market cap", "p/e", "pe ratio",
-                  "volume", "valuation", "fundamental", "risk", "volatility", "fx", "exchange rate"]
-    ):
+    if any(w in lowered for w in _STOCK_KEYWORDS):
         routes.append("stocks")
-    if any(w in lowered for w in ["news", "sentiment", "headline", "analyst", "earnings", "outlook"]):
+    if any(w in lowered for w in _NEWS_KEYWORDS):
         routes.append("news")
-    # Default: if a ticker is present assume a stock lookup, else news.
     if not routes:
-        routes.append("stocks" if extract_ticker(text) else "news")
+        # A ticker on its own implies a stock lookup; anything else is chat.
+        routes.append("stocks" if extract_ticker(text) else "chat")
     return routes
 
 
@@ -108,12 +127,16 @@ Available workflows:
 - "stocks": price, fundamentals (market cap, P/E, volume), FX, and risk metrics.
 - "news": financial news headlines and market sentiment.
 - "buy": the user wants to purchase shares.
+- "chat": greetings, small talk, capability questions, or anything not about
+  markets/finance. Use this alone when nothing financial is being asked.
 
 Respond with ONLY a JSON object:
-{{"routes": ["stocks"|"news"|"buy", ...], "ticker": "SYMBOL or null", "quantity": <int or null>}}
+{{"routes": ["stocks"|"news"|"buy"|"chat", ...], "ticker": "SYMBOL or null", "quantity": <int or null>}}
 
 User request: {query}
 """
+
+_VALID_ROUTES = {"stocks", "news", "buy", "chat"}
 
 
 def supervisor(state: AgentState) -> dict:
@@ -123,6 +146,19 @@ def supervisor(state: AgentState) -> dict:
         if isinstance(msg, HumanMessage):
             query = msg.content if isinstance(msg.content, str) else str(msg.content)
             break
+
+    # Fast path: greetings / small talk / out-of-scope input. Skip the LLM
+    # router AND every network-bound tool so these turns respond instantly
+    # instead of running a slow news/market lookup on irrelevant text.
+    if not _is_financial(query):
+        return {
+            "query": query,
+            "routes": ["chat"],
+            "ticker": None,
+            "quantity": None,
+            "tool_history": [],
+            "needs_approval": False,
+        }
 
     routes: List[str] = []
     ticker = extract_ticker(query)
@@ -134,7 +170,7 @@ def supervisor(state: AgentState) -> dict:
             resp = llm.invoke(_SUPERVISOR_PROMPT.format(query=query))
             raw = resp.content if isinstance(resp.content, str) else str(resp.content)
             payload = json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group(0))
-            routes = [r for r in payload.get("routes", []) if r in {"stocks", "news", "buy"}]
+            routes = [r for r in payload.get("routes", []) if r in _VALID_ROUTES]
             ticker = payload.get("ticker") or ticker
             if isinstance(payload.get("quantity"), int):
                 quantity = payload["quantity"]
@@ -143,6 +179,10 @@ def supervisor(state: AgentState) -> dict:
 
     if not routes:
         routes = _keyword_routes(query)
+
+    # "chat" is exclusive: if any real financial workflow was selected, drop it.
+    financial = [r for r in routes if r != "chat"]
+    routes = financial or ["chat"]
 
     if ticker in (None, "null", ""):
         ticker = None
@@ -168,15 +208,15 @@ def stock_fetcher(state: AgentState) -> dict:
         return {"stock_data": {"error": "no ticker identified in the request"}}
 
     history = list(state.get("tool_history", []))
-    price = tools.get_stock_price.func(ticker)  # type: ignore[attr-defined]
-    fundamentals = tools.get_stock_fundamentals.func(ticker)  # type: ignore[attr-defined]
+    price = tools.get_stock_price.invoke({"symbol": ticker})
+    fundamentals = tools.get_stock_fundamentals.invoke({"symbol": ticker})
     history += ["get_stock_price", "get_stock_fundamentals"]
 
     stock_data = {**price, **{k: v for k, v in fundamentals.items() if k != "error"}}
 
     # Optional FX if the user asked about exchange rates.
     if "fx" in state.get("query", "").lower() or "exchange rate" in state.get("query", "").lower():
-        stock_data["fx"] = tools.get_fx_rate.func("EUR", "USD")  # type: ignore[attr-defined]
+        stock_data["fx"] = tools.get_fx_rate.invoke({"from_currency": "EUR", "to_currency": "USD"})
         history.append("get_fx_rate")
 
     return {"stock_data": stock_data, "tool_history": history}
@@ -203,7 +243,7 @@ def news_agent(state: AgentState) -> dict:
     ticker = state.get("ticker")
     query = state.get("query", "")
     topic = f"{ticker} stock" if ticker else query
-    results = tools.analyze_news_sentiment.func(topic)  # type: ignore[attr-defined]
+    results = tools.analyze_news_sentiment.invoke({"query": topic})
     history = list(state.get("tool_history", [])) + ["analyze_news_sentiment"]
     return {"news_results": results, "tool_history": history}
 
@@ -218,7 +258,7 @@ def purchase_agent(state: AgentState) -> dict:
     quantity = state.get("quantity") or 1
     if not ticker:
         return {"purchase": {"status": "error", "message": "no ticker to purchase"}}
-    result = tools.purchase_stock.func(symbol=ticker, quantity=quantity)  # type: ignore[attr-defined]
+    result = tools.purchase_stock.invoke({"symbol": ticker, "quantity": quantity})
     history = list(state.get("tool_history", [])) + ["purchase_stock"]
     return {"purchase": result, "tool_history": history}
 
@@ -306,8 +346,26 @@ Aggregated data (JSON):
 {data}
 """
 
+_CHAT_RESPONSE = (
+    "Hi! I'm **MarketMind AI**, your financial research assistant. I can help you with:\n\n"
+    "- **Stock data** — live price, market cap, P/E ratio, volume and FX rates\n"
+    "- **Risk analysis** — volatility, Sharpe ratio, max drawdown and an overall risk level\n"
+    "- **News & sentiment** — the latest headlines and market mood for a company\n"
+    "- **Simulated trading** — buy shares, with a human approval step before anything executes\n\n"
+    "Try asking me something like:\n"
+    "- *What's the price and risk for AAPL?*\n"
+    "- *Latest news sentiment on Tesla*\n"
+    "- *Buy 10 shares of MSFT*\n\n"
+    "What would you like to look into?"
+)
+
 
 def response_synthesizer(state: AgentState) -> dict:
+    # General chat / greetings / out-of-scope: return the capability overview
+    # directly. No LLM or tool calls, so this is effectively instant.
+    if state.get("routes") == ["chat"]:
+        return {"final_response": _CHAT_RESPONSE, "messages": [AIMessage(content=_CHAT_RESPONSE)]}
+
     llm = get_llm()
     final = ""
     if llm is not None:

@@ -16,6 +16,17 @@ from langgraph.types import interrupt
 
 from . import config
 
+# ``traceable`` makes plain helper functions (risk maths, price history, news
+# scoring) show up as their own steps in LangSmith. It degrades to a no-op
+# decorator when LangSmith isn't installed.
+try:  # pragma: no cover - optional dependency
+    from langsmith import traceable
+except Exception:  # pragma: no cover
+    def traceable(func=None, **_kwargs):  # type: ignore[misc]
+        if func is None:
+            return lambda f: f
+        return func
+
 # ---------------------------------------------------------------------------
 # Optional dependencies (imported lazily / defensively)
 # ---------------------------------------------------------------------------
@@ -119,6 +130,7 @@ def get_fx_rate(from_currency: str = "EUR", to_currency: str = "USD") -> dict:
         return {"pair": pair, "error": f"fx lookup failed: {exc}"}
 
 
+@traceable(run_type="tool", name="get_price_history")
 def get_price_history(symbol: str, period: str = "6mo") -> List[float]:
     """Return a list of daily closing prices (helper, not an LLM tool)."""
     if yf is None:
@@ -133,6 +145,7 @@ def get_price_history(symbol: str, period: str = "6mo") -> List[float]:
 # ===========================================================================
 # Risk metrics
 # ===========================================================================
+@traceable(run_type="tool", name="compute_risk_metrics")
 def compute_risk_metrics(prices: List[float]) -> Dict[str, Any]:
     """Compute volatility, Sharpe ratio, max drawdown and a risk level.
 
@@ -204,6 +217,7 @@ _NEGATIVE = {
 }
 
 
+@traceable(run_type="tool", name="score_sentiment")
 def score_sentiment(texts: List[str]) -> Dict[str, Any]:
     """Lightweight lexicon-based sentiment over a list of headlines/snippets."""
     pos = neg = 0
@@ -233,13 +247,15 @@ def search_headlines(query: str, max_results: int = 6) -> dict:
         return {"query": query, "error": "DuckDuckGo backend (ddgs) not available", "headlines": []}
     try:
         headlines: List[str] = []
-        with DDGS() as ddgs:
+        # Cap the network wait so a slow/unreachable backend can't stall the
+        # whole pipeline (a major source of first-response latency).
+        with DDGS(timeout=8) as ddgs:
             for item in ddgs.news(query, region="us-en", max_results=max_results):
                 title = item.get("title")
                 if title:
                     headlines.append(title)
         if not headlines:
-            with DDGS() as ddgs:
+            with DDGS(timeout=8) as ddgs:
                 for item in ddgs.text(query, region="us-en", max_results=max_results):
                     title = item.get("title")
                     if title:
@@ -252,7 +268,7 @@ def search_headlines(query: str, max_results: int = 6) -> dict:
 @tool
 def analyze_news_sentiment(query: str) -> dict:
     """Search news for a topic and return headlines plus an overall sentiment label."""
-    result = search_headlines.func(query)  # type: ignore[attr-defined]
+    result = search_headlines.invoke({"query": query})
     headlines = result.get("headlines", [])
     sentiment = score_sentiment(headlines)
     return {**result, **sentiment}

@@ -144,32 +144,62 @@ def _latest_answer(thread_id: str) -> str:
 
 
 def _activity_md(thread_id: str) -> str:
-    """Summarise the agent's reasoning + tool/API usage for the latest turn.
+    """Summarise the multi-agent orchestration for the latest turn.
 
-    Surfaces the Supervisor's routing decision, the extracted ticker and the
-    tools/APIs actually executed — so the UI visibly demonstrates *why* the
-    agent did what it did and *which* tools ran (assignment Steps 5 & 6).
+    Shows which sub-agents were invoked by the orchestrator, extracted entities,
+    and any pending approval status.
     """
     try:
         vals = APP.get_state(_config(thread_id)).values
     except Exception:
-        return "_No activity yet — ask a question to see the agent's routing and tool usage._"
+        return "_No activity yet — ask a question to see multi-agent orchestration._"
 
-    routes = vals.get("routes") or []
-    if not routes or routes == ["chat"]:
-        return "**Detected intent:** `chat` — handled directly, _no tools or external APIs were called for this turn._"
+    agents_called = vals.get("agents_called") or []
+    query = vals.get("query", "")
 
-    lines = ["**Detected intent:** " + ", ".join(f"`{r}`" for r in routes)]
+    if not agents_called and not query:
+        return "_No activity yet — ask a question to see multi-agent orchestration._"
+
+    lines = []
+
+    if query:
+        lines.append(f"**Query:** {query[:100]}{'...' if len(query) > 100 else ''}")
+
+    if agents_called:
+        agent_names = {
+            "stock": "Stock Analyst",
+            "news": "News Analyst",
+            "trade": "Trade Executor",
+            "chat": "Chat Assistant",
+            "stock_analyst": "Stock Analyst",
+            "news_analyst": "News Analyst",
+            "trade_executor": "Trade Executor",
+            "chat_assistant": "Chat Assistant",
+        }
+        named = [agent_names.get(a, a) for a in agents_called]
+        lines.append("**Sub-agents invoked:** " + ", ".join(f"`{n}`" for n in named))
+    else:
+        lines.append("**Architecture:** Orchestrator → Sub-agent tools → Synthesizer")
+
     if vals.get("ticker"):
         lines.append(f"**Ticker:** `{vals['ticker']}`")
     if vals.get("quantity"):
         lines.append(f"**Quantity:** `{vals['quantity']}`")
-    tools_used = vals.get("tool_history") or []
-    if tools_used:
-        lines.append("**Tools / APIs called:** " + ", ".join(f"`{t}`" for t in tools_used))
+
+    if vals.get("aggregated"):
+        agg = vals["aggregated"]
+        if agg.get("stock_result"):
+            lines.append("**Stock data:** ✓ received")
+        if agg.get("news_result"):
+            lines.append("**News data:** ✓ received")
+        if agg.get("trade_result"):
+            status = agg["trade_result"].get("status", "unknown")
+            lines.append(f"**Trade status:** {status}")
+
     if _pending_interrupt(thread_id):
         lines.append("**Status:** ⏸ paused — awaiting human approval")
-    return "\n\n".join(lines)
+
+    return "\n\n".join(lines) if lines else "_Orchestrator is processing..._"
 
 
 def _approval_update(payload: Optional[dict]):

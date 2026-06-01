@@ -12,7 +12,6 @@ from typing import Any, Dict, List
 
 import requests
 from langchain_core.tools import tool
-from langgraph.types import interrupt
 
 from . import config
 
@@ -145,15 +144,16 @@ def get_price_history(symbol: str, period: str = "6mo") -> List[float]:
 # ===========================================================================
 # Risk metrics
 # ===========================================================================
-@traceable(run_type="tool", name="compute_risk_metrics")
-def compute_risk_metrics(prices: List[float]) -> Dict[str, Any]:
-    """Compute volatility, Sharpe ratio, max drawdown and a risk level.
+@tool
+def compute_risk_metrics(symbol: str) -> Dict[str, Any]:
+    """Compute volatility, Sharpe ratio, max drawdown and a risk level for a ticker.
 
-    Operates on a list of daily closing prices. Returns an ``error`` field if
-    there is not enough data.
+    Fetches 6 months of price history and calculates risk metrics. Returns an
+    ``error`` field if there is not enough data.
     """
+    prices = get_price_history(symbol)
     if not prices or len(prices) < 2:
-        return {"error": "insufficient price history for risk analysis"}
+        return {"symbol": symbol, "error": "insufficient price history for risk analysis"}
 
     # Daily simple returns.
     returns = [
@@ -162,7 +162,7 @@ def compute_risk_metrics(prices: List[float]) -> Dict[str, Any]:
         if prices[i - 1]
     ]
     if not returns:
-        return {"error": "could not compute returns"}
+        return {"symbol": symbol, "error": "could not compute returns"}
 
     n = len(returns)
     mean = sum(returns) / n
@@ -193,6 +193,7 @@ def compute_risk_metrics(prices: List[float]) -> Dict[str, Any]:
         level = "High"
 
     return {
+        "symbol": symbol,
         "volatility": round(annual_vol, 4),
         "annual_return": round(annual_return, 4),
         "sharpe_ratio": round(sharpe, 2),
@@ -275,41 +276,43 @@ def analyze_news_sentiment(query: str) -> dict:
 
 
 # ===========================================================================
-# Purchase tool (human-in-the-loop)
+# Purchase tool (prepares order for HITL approval at main graph level)
 # ===========================================================================
 @tool
 def purchase_stock(symbol: str, quantity: int) -> dict:
-    """Place a (simulated) order to buy ``quantity`` shares of ``symbol``.
+    """Prepare a (simulated) order to buy ``quantity`` shares of ``symbol``.
 
-    HUMAN-IN-THE-LOOP: the graph pauses via ``interrupt`` and waits for an
-    explicit human decision ("yes"/"no") before the order is executed.
+    Returns a pending order that requires human approval. The actual HITL
+    interrupt happens at the main graph level, not inside the sub-agent.
     """
-    decision = interrupt(
-        {
-            "action": "purchase",
-            "symbol": symbol.upper(),
-            "quantity": quantity,
-            "prompt": f"Approve buying {quantity} shares of {symbol.upper()}? (yes/no)",
-        }
-    )
-    approved = isinstance(decision, str) and decision.strip().lower() in {"yes", "y", "approve"}
+    return {
+        "status": "pending_approval",
+        "symbol": symbol.upper(),
+        "quantity": quantity,
+        "prompt": f"Approve buying {quantity} shares of {symbol.upper()}? (yes/no)",
+        "message": f"Order prepared: Buy {quantity} shares of {symbol.upper()}. Awaiting human approval.",
+    }
+
+
+def execute_trade(symbol: str, quantity: int, approved: bool) -> dict:
+    """Execute a prepared trade after human approval decision."""
     if approved:
         return {
-            "status": "success",
+            "status": "executed",
             "symbol": symbol.upper(),
             "quantity": quantity,
-            "message": f"Purchase order placed for {quantity} shares of {symbol.upper()}.",
+            "message": f"SUCCESS: Purchase order executed for {quantity} shares of {symbol.upper()}.",
         }
     return {
         "status": "cancelled",
         "symbol": symbol.upper(),
         "quantity": quantity,
-        "message": f"Purchase of {quantity} shares of {symbol.upper()} was declined.",
+        "message": f"CANCELLED: Purchase of {quantity} shares of {symbol.upper()} was declined by user.",
     }
 
 
 # Convenience groupings used by the graph.
-STOCK_TOOLS = [get_stock_price, get_stock_fundamentals, get_fx_rate]
-NEWS_TOOLS = [search_headlines, analyze_news_sentiment]
+STOCK_TOOLS = [get_stock_price, get_stock_fundamentals, compute_risk_metrics]
+NEWS_TOOLS = [search_headlines, analyze_news_sentiment, get_fx_rate]
 TRADE_TOOLS = [purchase_stock]
 ALL_TOOLS = STOCK_TOOLS + NEWS_TOOLS + TRADE_TOOLS

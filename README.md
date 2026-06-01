@@ -251,6 +251,34 @@ Open the local URL Gradio prints (usually `http://127.0.0.1:7860`).
 
 ---
 
+## Screenshots & Screen Recording
+
+### Screenshots
+
+All UI screenshots are available in the `screenshots/` folder:
+
+- `screenshots/Screenshot 2026-06-01 062254.png`
+- `screenshots/Screenshot 2026-06-01 062335.png`
+- `screenshots/Screenshot 2026-06-01 062425.png`
+- `screenshots/Screenshot 2026-06-01 062536.png`
+
+Preview:
+
+![MarketMind screenshot 1](screenshots/Screenshot%202026-06-01%20062254.png)
+![MarketMind screenshot 2](screenshots/Screenshot%202026-06-01%20062335.png)
+![MarketMind screenshot 3](screenshots/Screenshot%202026-06-01%20062425.png)
+![MarketMind screenshot 4](screenshots/Screenshot%202026-06-01%20062536.png)
+
+### Screen Recording
+
+A demo recording is included at:
+
+- `gradio-screen-recording.mp4`
+
+You can open/download it directly from the repository to watch the full app flow.
+
+---
+
 ## Notes & Disclaimer
 
 - Trades are **simulated**; no real orders are placed

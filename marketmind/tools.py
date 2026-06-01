@@ -12,7 +12,6 @@ from typing import Any, Dict, List
 
 import requests
 from langchain_core.tools import tool
-from langgraph.types import interrupt
 
 from . import config
 
@@ -277,36 +276,38 @@ def analyze_news_sentiment(query: str) -> dict:
 
 
 # ===========================================================================
-# Purchase tool (human-in-the-loop)
+# Purchase tool (prepares order for HITL approval at main graph level)
 # ===========================================================================
 @tool
 def purchase_stock(symbol: str, quantity: int) -> dict:
-    """Place a (simulated) order to buy ``quantity`` shares of ``symbol``.
+    """Prepare a (simulated) order to buy ``quantity`` shares of ``symbol``.
 
-    HUMAN-IN-THE-LOOP: the graph pauses via ``interrupt`` and waits for an
-    explicit human decision ("yes"/"no") before the order is executed.
+    Returns a pending order that requires human approval. The actual HITL
+    interrupt happens at the main graph level, not inside the sub-agent.
     """
-    decision = interrupt(
-        {
-            "action": "purchase",
-            "symbol": symbol.upper(),
-            "quantity": quantity,
-            "prompt": f"Approve buying {quantity} shares of {symbol.upper()}? (yes/no)",
-        }
-    )
-    approved = isinstance(decision, str) and decision.strip().lower() in {"yes", "y", "approve"}
+    return {
+        "status": "pending_approval",
+        "symbol": symbol.upper(),
+        "quantity": quantity,
+        "prompt": f"Approve buying {quantity} shares of {symbol.upper()}? (yes/no)",
+        "message": f"Order prepared: Buy {quantity} shares of {symbol.upper()}. Awaiting human approval.",
+    }
+
+
+def execute_trade(symbol: str, quantity: int, approved: bool) -> dict:
+    """Execute a prepared trade after human approval decision."""
     if approved:
         return {
-            "status": "success",
+            "status": "executed",
             "symbol": symbol.upper(),
             "quantity": quantity,
-            "message": f"Purchase order placed for {quantity} shares of {symbol.upper()}.",
+            "message": f"SUCCESS: Purchase order executed for {quantity} shares of {symbol.upper()}.",
         }
     return {
         "status": "cancelled",
         "symbol": symbol.upper(),
         "quantity": quantity,
-        "message": f"Purchase of {quantity} shares of {symbol.upper()} was declined.",
+        "message": f"CANCELLED: Purchase of {quantity} shares of {symbol.upper()} was declined by user.",
     }
 
 

@@ -91,6 +91,10 @@ class AgentState(TypedDict, total=False):
     needs_approval: bool
     revision_notes: str
 
+    # Pending trade awaiting human approval (HITL at main graph level).
+    pending_trade: Optional[dict]  # {"symbol": str, "quantity": int, "prompt": str}
+    trade_approved: Optional[bool]  # None = pending, True = approved, False = declined
+
     # Private channel for trade tool execution (isolates tool messages from chat).
     trade_messages: Annotated[List[BaseMessage], add_messages]
 

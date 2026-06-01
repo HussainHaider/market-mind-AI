@@ -11,15 +11,17 @@ This module implements a true multi-agent system where:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from functools import lru_cache
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import interrupt
 
 from . import config, tools
 from .state import AgentState, SubAgentState
@@ -81,7 +83,12 @@ MarketMind can do:
 - News & sentiment: the latest headlines and market mood
 - Simulated trading: buy shares with human approval
 
-Be helpful and guide users on how to use the system effectively."""
+IMPORTANT: For simple greetings like "Hi", "Hello", "Hey", respond in a friendly, conversational way.
+For example: "Hi! How can I help you today? I can look up stock prices, analyze risk metrics, 
+find recent news and sentiment, or help you explore market data."
+
+Be warm, helpful, and guide users on how to use the system effectively. Keep responses concise
+but informative."""
 
 
 # ===========================================================================
@@ -235,7 +242,22 @@ def _get_subagent_tools():
         @tool
         def trade_executor(query: str) -> str:
             """Execute a stock purchase order. IMPORTANT: This will pause for human approval. Input: a message with the trade details, e.g. 'Buy 10 shares of MSFT'."""
-            return _invoke_subagent(trade_agent, query)
+            result = trade_agent.invoke({"messages": [HumanMessage(content=query)]})
+            messages = result.get("messages", [])
+            
+            # Check for pending approval in tool messages (raw tool output)
+            for msg in messages:
+                if hasattr(msg, "content") and msg.content:
+                    content = str(msg.content)
+                    if "pending_approval" in content.lower():
+                        # Return the raw pending approval info for main graph to detect
+                        return content
+            
+            # Otherwise return the AI response as normal
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    return msg.content if isinstance(msg.content, str) else str(msg.content)
+            return "No response from agent."
         subagent_tools.append(trade_executor)
 
     chat_agent = _build_chat_agent()
@@ -356,6 +378,107 @@ def _fallback_orchestrator(state: AgentState, query: str):
 
 
 # ===========================================================================
+# Trade Approval Handler (HITL at main graph level)
+# ===========================================================================
+def _extract_pending_trade(state: AgentState) -> dict | None:
+    """Check if any tool output contains a pending trade approval request."""
+    for msg in reversed(state.get("messages", [])):
+        content = None
+        if isinstance(msg, ToolMessage) and msg.content:
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        elif isinstance(msg, AIMessage) and msg.content:
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        
+        if not content:
+            continue
+            
+        # Check for pending_approval status in the content
+        if "pending_approval" in content.lower():
+            try:
+                # Try multiple regex patterns for different formats
+                # Pattern 1: 'symbol': 'MSFT' format
+                symbol_match = re.search(r"['\"]symbol['\"]\s*:\s*['\"]([A-Z]+)['\"]", content)
+                # Pattern 2: "symbol": "MSFT" format  
+                if not symbol_match:
+                    symbol_match = re.search(r"symbol['\"]?\s*:\s*['\"]?([A-Z]+)['\"]?", content, re.IGNORECASE)
+                
+                # Pattern 1: 'quantity': 10 format
+                quantity_match = re.search(r"['\"]quantity['\"]\s*:\s*(\d+)", content)
+                # Pattern 2: quantity: 10 format
+                if not quantity_match:
+                    quantity_match = re.search(r"quantity['\"]?\s*:\s*(\d+)", content, re.IGNORECASE)
+                
+                # Pattern for prompt
+                prompt_match = re.search(r"['\"]prompt['\"]\s*:\s*['\"]([^'\"]+)['\"]", content)
+                
+                if symbol_match and quantity_match:
+                    symbol = symbol_match.group(1).upper()
+                    quantity = int(quantity_match.group(1))
+                    prompt = prompt_match.group(1) if prompt_match else f"Approve buying {quantity} shares of {symbol}? (yes/no)"
+                    return {
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "prompt": prompt,
+                    }
+            except Exception:
+                pass
+    return None
+
+
+def _trade_approval_node(state: AgentState):
+    """Handle HITL interrupt for pending trades at the main graph level."""
+    # Check if we already have a pending trade that was approved/declined
+    if state.get("trade_approved") is not None:
+        # Trade decision already made, execute the trade
+        pending = state.get("pending_trade")
+        if pending:
+            result = tools.execute_trade(
+                pending["symbol"],
+                pending["quantity"],
+                state["trade_approved"]
+            )
+            return {
+                "trade_result": result,
+                "pending_trade": None,
+                "messages": [AIMessage(content=result["message"])],
+            }
+        return {}
+    
+    # Check for a new pending trade
+    pending = _extract_pending_trade(state)
+    if pending:
+        # We have a pending trade, interrupt for human approval
+        decision = interrupt({
+            "action": "purchase",
+            "symbol": pending["symbol"],
+            "quantity": pending["quantity"],
+            "prompt": pending["prompt"],
+        })
+        
+        # Process the decision
+        approved = isinstance(decision, str) and decision.strip().lower() in {"yes", "y", "approve"}
+        result = tools.execute_trade(pending["symbol"], pending["quantity"], approved)
+        
+        return {
+            "trade_result": result,
+            "pending_trade": None,
+            "trade_approved": None,  # Reset for next trade
+            "messages": [AIMessage(content=result["message"])],
+        }
+    
+    # No pending trade
+    return {}
+
+
+def _needs_trade_approval(state: AgentState) -> str:
+    """Route to trade approval if there's a pending trade, else back to orchestrator."""
+    pending = _extract_pending_trade(state)
+    if pending:
+        return "trade_approval"
+    return "continue"  # Go back to orchestrator for normal flow
+
+
+# ===========================================================================
 # Response Synthesizer
 # ===========================================================================
 SYNTHESIZER_PROMPT = """You are the Response Synthesizer for MarketMind AI.
@@ -366,11 +489,15 @@ Using the data provided, write a concise financial summary that includes:
 - Stock data (if available): price, market cap, P/E ratio, volume
 - Risk metrics (if available): volatility, Sharpe ratio, max drawdown, risk level
 - News sentiment (if available): key headlines and overall sentiment
-- Trade status (if applicable): order confirmation or cancellation
+- Trade execution status (if applicable): 
+  * If status is "executed" - confirm the purchase was completed successfully
+  * If status is "cancelled" - confirm the purchase was declined/cancelled
+  * If status is "pending_approval" - this should not appear here (handled separately)
 
 Guidelines:
 - Use markdown formatting for readability
 - Never invent numbers that aren't in the data
+- For trade results, be clear and direct about whether the trade was executed or cancelled
 - Give a brief, clearly-hedged recommendation if appropriate
 - Be concise but comprehensive
 
@@ -381,16 +508,16 @@ Agent outputs:
 """
 
 CHAT_RESPONSE = (
-    "Hi! I'm **MarketMind AI**, your financial research assistant. I can help you with:\n\n"
-    "- **Stock data** — live price, market cap, P/E ratio, volume and FX rates\n"
-    "- **Risk analysis** — volatility, Sharpe ratio, max drawdown and an overall risk level\n"
-    "- **News & sentiment** — the latest headlines and market mood for a company\n"
-    "- **Simulated trading** — buy shares, with a human approval step before anything executes\n\n"
-    "Try asking me something like:\n"
+    "Hi! How can I help you today?\n\n"
+    "I'm **MarketMind AI**, your financial research assistant. I can:\n\n"
+    "- Look up **stock prices** and fundamentals (market cap, P/E ratio, volume)\n"
+    "- Analyze **risk metrics** (volatility, Sharpe ratio, max drawdown)\n"
+    "- Find **news headlines** and sentiment for any company\n"
+    "- Execute **simulated trades** (with your approval)\n\n"
+    "Try asking something like:\n"
     "- *What's the price and risk for AAPL?*\n"
     "- *Latest news sentiment on Tesla*\n"
-    "- *Buy 10 shares of MSFT*\n\n"
-    "What would you like to look into?"
+    "- *Buy 10 shares of MSFT*"
 )
 
 
@@ -399,29 +526,52 @@ def _response_synthesizer_node(state: AgentState):
     query = state.get("query", "")
     agents_called = state.get("agents_called", [])
 
-    # Check if this was just a chat query
-    if agents_called == ["chat"] or not agents_called:
-        # Check message content for chat indicators
+    # Check if this was just a chat/greeting query (no financial data needed)
+    chat_only = (
+        agents_called in [["chat"], ["chat_assistant"]]
+        or (len(agents_called) == 1 and agents_called[0] in ("chat", "chat_assistant"))
+        or not agents_called
+    )
+    
+    if chat_only:
+        # For chat-only queries, extract and return the chat agent's response directly
         msgs = state.get("messages", [])
-        last_ai = None
+        
+        # Look for the chat agent's actual response in tool messages
         for msg in reversed(msgs):
-            if isinstance(msg, AIMessage) and msg.content:
-                last_ai = msg.content
-                break
-
-        if last_ai and ("[Fallback routing: chat]" in last_ai or "chat_assistant" in str(last_ai)):
-            return {
-                "final_response": CHAT_RESPONSE,
-                "messages": [AIMessage(content=CHAT_RESPONSE)],
-            }
+            # Check for tool message content (the chat_assistant's response)
+            if hasattr(msg, "content") and msg.content:
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                # Skip orchestrator routing messages and empty responses
+                if content and not content.startswith("[Fallback") and "tool_calls" not in content.lower():
+                    # This is likely the chat agent's response - use it directly
+                    if len(content) > 50 and ("MarketMind" in content or "help" in content.lower() or "?" in content):
+                        return {
+                            "final_response": content,
+                            "messages": [AIMessage(content=content)],
+                        }
+        
+        # Fallback to the default chat response
+        return {
+            "final_response": CHAT_RESPONSE,
+            "messages": [AIMessage(content=CHAT_RESPONSE)],
+        }
 
     # Gather all data from messages
+    trade_result = state.get("trade_result")
     aggregated = {
         "stock_result": state.get("stock_result"),
         "news_result": state.get("news_result"),
-        "trade_result": state.get("trade_result"),
+        "trade_result": trade_result,
         "agents_called": agents_called,
     }
+    
+    # If there's a trade result with executed/cancelled status, make it prominent
+    if trade_result and trade_result.get("status") in ("executed", "cancelled"):
+        # Include the trade message directly in outputs for the LLM to see
+        trade_msg = trade_result.get("message", "")
+        if trade_msg:
+            aggregated["trade_execution_message"] = trade_msg
 
     # Also extract tool results from messages
     tool_outputs = []
@@ -496,6 +646,7 @@ def build_graph(checkpointer=None):
     # Add nodes
     graph.add_node("orchestrator", _orchestrator_node)
     graph.add_node("agent_tools", ToolNode(subagent_tools) if subagent_tools else _noop_node)
+    graph.add_node("trade_approval", _trade_approval_node)
     graph.add_node("synthesizer", _response_synthesizer_node)
     graph.add_node("approval_gate", _approval_gate_node)
 
@@ -506,7 +657,14 @@ def build_graph(checkpointer=None):
         tools_condition,
         {"tools": "agent_tools", END: "synthesizer"},
     )
-    graph.add_edge("agent_tools", "orchestrator")
+    # After tools execute, check if there's a pending trade needing approval
+    graph.add_conditional_edges(
+        "agent_tools",
+        _needs_trade_approval,
+        {"trade_approval": "trade_approval", "continue": "orchestrator"},
+    )
+    # After trade approval, go to synthesizer to format the response
+    graph.add_edge("trade_approval", "synthesizer")
     graph.add_edge("synthesizer", "approval_gate")
     graph.add_conditional_edges(
         "approval_gate",

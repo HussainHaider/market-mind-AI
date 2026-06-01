@@ -145,15 +145,16 @@ def get_price_history(symbol: str, period: str = "6mo") -> List[float]:
 # ===========================================================================
 # Risk metrics
 # ===========================================================================
-@traceable(run_type="tool", name="compute_risk_metrics")
-def compute_risk_metrics(prices: List[float]) -> Dict[str, Any]:
-    """Compute volatility, Sharpe ratio, max drawdown and a risk level.
+@tool
+def compute_risk_metrics(symbol: str) -> Dict[str, Any]:
+    """Compute volatility, Sharpe ratio, max drawdown and a risk level for a ticker.
 
-    Operates on a list of daily closing prices. Returns an ``error`` field if
-    there is not enough data.
+    Fetches 6 months of price history and calculates risk metrics. Returns an
+    ``error`` field if there is not enough data.
     """
+    prices = get_price_history(symbol)
     if not prices or len(prices) < 2:
-        return {"error": "insufficient price history for risk analysis"}
+        return {"symbol": symbol, "error": "insufficient price history for risk analysis"}
 
     # Daily simple returns.
     returns = [
@@ -162,7 +163,7 @@ def compute_risk_metrics(prices: List[float]) -> Dict[str, Any]:
         if prices[i - 1]
     ]
     if not returns:
-        return {"error": "could not compute returns"}
+        return {"symbol": symbol, "error": "could not compute returns"}
 
     n = len(returns)
     mean = sum(returns) / n
@@ -193,6 +194,7 @@ def compute_risk_metrics(prices: List[float]) -> Dict[str, Any]:
         level = "High"
 
     return {
+        "symbol": symbol,
         "volatility": round(annual_vol, 4),
         "annual_return": round(annual_return, 4),
         "sharpe_ratio": round(sharpe, 2),

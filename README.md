@@ -1,155 +1,182 @@
 # MarketMind AI
 
-**MarketMind AI** is a multi-agent investment-research assistant built with
-**LangChain + LangGraph**. It evaluates securities, monitors market sentiment,
-analyses fundamentals and assesses financial risk — with a **human-in-the-loop
-approval** step before any sensitive action such as placing a trade.
+**MarketMind AI** is a **true multi-agent** investment-research assistant built with
+**LangChain + LangGraph**. It uses an **Orchestrator-Workers** architecture where
+specialized sub-agents handle stock analysis, news sentiment, trading, and general
+chat — each with their own LLM and tools.
 
-It is powered by a **LangGraph** state machine with **conditional routing** and a
-prebuilt **`ToolNode`**, an **OpenAI** LLM (with a full offline fallback), a
-**Gradio** chat frontend, **DuckDuckGo / Alpha Vantage / Yahoo Finance** as
-external API tools, and a **SQLite-backed checkpointer** for persistent,
-multi-turn conversation memory.
+The system features **human-in-the-loop approval** for sensitive actions (trades),
+**persistent memory** via SQLite checkpointing, and a **Gradio chat interface**.
 
 ---
 
-## 1. Project title
+## Architecture Overview
 
-**MarketMind AI — A Multi-Agent Financial Research Assistant.**
+MarketMind implements a **hierarchical multi-agent system**:
 
-## 2. Selected use case
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    LangGraph Multi-Agent System                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                      ┌──────────────────┐                       │
+│                      │   Orchestrator   │                       │
+│                      │  LLM + dispatch  │                       │
+│                      └────────┬─────────┘                       │
+│              ┌────────────────┼────────────────┐                │
+│              ▼                ▼                ▼                │
+│    ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐ │
+│    │ Stock Analyst   │ │ News Analyst    │ │ Trade Agent     │ │
+│    │ own LLM + tools │ │ own LLM + tools │ │ LLM + HITL      │ │
+│    └────────┬────────┘ └────────┬────────┘ └────────┬────────┘ │
+│             │                   │                   │           │
+│             ▼                   ▼                   ▼           │
+│    ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐ │
+│    │   ToolNode      │ │   ToolNode      │ │   ToolNode      │ │
+│    │ price/risk/fund │ │ headlines/sent  │ │ purchase_stock  │ │
+│    └────────┬────────┘ └────────┬────────┘ └────────┬────────┘ │
+│             │                   │                   │           │
+│             └───────────────────┼───────────────────┘           │
+│                                 ▼                               │
+│                    ┌──────────────────────┐                     │
+│                    │ Response Synthesizer │                     │
+│                    │   LLM aggregates     │                     │
+│                    └──────────┬───────────┘                     │
+│                               ▼                                 │
+│                    ┌──────────────────────┐                     │
+│                    │   Approval Gate +    │                     │
+│                    │   SqliteSaver        │                     │
+│                    └──────────┬───────────┘                     │
+│                               ▼                                 │
+│                         END / Gradio UI                         │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-A conversational **financial research analyst**. A user can, in plain English:
+See [`marketmind_target_architecture.svg`](marketmind_target_architecture.svg) for the detailed visual diagram.
 
-- Look up a stock's **price, fundamentals (market cap, P/E, volume) and FX rate**.
-- Get a quantitative **risk assessment** (volatility, Sharpe ratio, max drawdown).
-- Read the latest **news headlines and a sentiment read** for a company.
-- **Place a (simulated) buy order**, which always pauses for explicit human
-  approval before "executing".
+---
 
-It is a good agentic use case because a single request ("*What's the price, risk
-and news on AAPL, and should I buy 10 shares?*") legitimately requires **multiple
-tools, multiple external APIs, dynamic routing and a human approval gate** — the
-exact capabilities the assignment asks for.
+## 1. Project Title
 
-## 3. Tools used
+**MarketMind AI — A Multi-Agent Financial Research Assistant**
+
+## 2. Selected Use Case
+
+A conversational **financial research analyst** powered by specialized agents. Users can:
+
+- Look up a stock's **price, fundamentals (market cap, P/E, volume) and FX rate**
+- Get a quantitative **risk assessment** (volatility, Sharpe ratio, max drawdown)
+- Read the latest **news headlines and sentiment** for a company
+- **Place a (simulated) buy order** with human-in-the-loop approval
+
+This is a strong multi-agent use case because a single query like "*What's the price, risk
+and news on AAPL, and should I buy 10 shares?*" requires **multiple specialized agents
+working together** with different tools and capabilities.
+
+## 3. Multi-Agent Architecture
+
+### Sub-Agents
+
+| Agent | LLM | Tools | Output |
+|-------|-----|-------|--------|
+| **Stock Analyst** | ChatOpenAI | `get_stock_price`, `get_stock_fundamentals`, `compute_risk_metrics` | `StockAnalysisResult` |
+| **News Analyst** | ChatOpenAI | `search_headlines`, `analyze_news_sentiment`, `get_fx_rate` | `NewsAnalysisResult` |
+| **Trade Executor** | ChatOpenAI | `purchase_stock` (with `interrupt`) | `TradeResult` |
+| **Chat Assistant** | ChatOpenAI | (none) | General conversation |
+
+Each sub-agent is a **compiled LangGraph** with its own:
+- System prompt defining its specialization
+- LLM instance bound to its specific tools
+- ReAct-style tool loop (`agent → ToolNode → tools_condition`)
+
+### Orchestrator
+
+The Orchestrator agent:
+1. Receives the user's query
+2. Decides which sub-agents to invoke (can call multiple)
+3. Calls sub-agents as **tools** via `graph.as_tool()`
+4. Collects results for the Response Synthesizer
+
+### Response Synthesizer
+
+Aggregates all sub-agent outputs into a coherent, well-formatted response using an LLM.
+
+### Approval Gate
+
+Final checkpoint that can route back to the synthesizer for revisions if requested.
+
+## 4. Tools Used
 
 | Tool | Type | What it does |
 |------|------|--------------|
 | `get_stock_price` | External API | Latest price (Alpha Vantage → Yahoo Finance fallback) |
 | `get_stock_fundamentals` | External API | Market cap, P/E, volume, name (Yahoo Finance) |
-| `get_fx_rate` | External API | FX rate between two currencies (Yahoo Finance) |
+| `compute_risk_metrics` | Custom + API | Volatility, Sharpe, drawdown from price history |
+| `get_fx_rate` | External API | FX rate between currencies (Yahoo Finance) |
 | `search_headlines` | External API | Recent news headlines (DuckDuckGo) |
-| `analyze_news_sentiment` | External API + custom | Headlines **+** lexicon sentiment scoring |
-| `compute_risk_metrics` | **Custom Python** | Volatility, Sharpe, drawdown, risk level |
-| `score_sentiment` | **Custom Python** | Lexicon-based sentiment over text |
-| `purchase_stock` | **Custom Python** (HITL) | Simulated order; `interrupt`s for approval |
+| `analyze_news_sentiment` | External API + custom | Headlines + lexicon sentiment scoring |
+| `purchase_stock` | Custom (HITL) | Simulated order; `interrupt`s for human approval |
 
-## 4. APIs integrated
+## 5. APIs Integrated
 
-- **Alpha Vantage** — real-time stock quotes (`GLOBAL_QUOTE`); used when
-  `ALPHA_VANTAGE_API_KEY` is set.
-- **Yahoo Finance** (via `yfinance`) — quotes, fundamentals, FX and historical
-  prices; also the automatic fallback for Alpha Vantage.
-- **DuckDuckGo** (via `ddgs`) — keyless news / web search for headlines.
-- **OpenAI** — LLM used by the Supervisor (routing/entity extraction) and the
-  Response Synthesizer (final answer).
+- **Alpha Vantage** — real-time stock quotes (when `ALPHA_VANTAGE_API_KEY` is set)
+- **Yahoo Finance** (via `yfinance`) — quotes, fundamentals, FX and historical prices
+- **DuckDuckGo** (via `ddgs`) — keyless news/web search for headlines
+- **OpenAI** — LLM for all agents (Orchestrator, sub-agents, Synthesizer)
 
-Every API call **degrades gracefully**: a missing key, a failed request or an
-offline environment falls back to a secondary provider or a structured `error`
-field rather than crashing.
+All API calls **degrade gracefully**: missing keys or failed requests fall back to
+secondary providers or structured error responses.
 
-## 5. LangGraph workflow explanation
+## 6. LangGraph Workflow
 
 ### State
 
-A single typed `AgentState` (`marketmind/state.py`) flows through every node. Key
-channels:
+A typed `AgentState` (`marketmind/state.py`) flows through the graph:
 
-- `messages` — the user-facing conversation (reduced with `add_messages`).
-- `trade_messages` — a **private** channel that drives the trade `ToolNode`, so
-  raw tool-call/tool-result messages never pollute the chat transcript.
-- `query`, `routes`, `ticker`, `quantity` — the Supervisor's intent + entities.
-- `stock_data`, `risk_score`, `news_results`, `purchase` — per-flow outputs.
-- `aggregated`, `tool_history`, `final_response`, `needs_approval`.
+- `messages` — conversation history (reduced with `add_messages`)
+- `query` — the latest user query
+- `ticker`, `quantity` — extracted entities
+- `stock_result`, `news_result`, `trade_result` — typed sub-agent outputs
+- `aggregated` — combined data for the synthesizer
+- `agents_called` — which sub-agents were invoked
+- `final_response` — the user-facing answer
+- `trade_messages` — private channel for trade tool execution
 
-### Nodes
+### Graph Flow
 
-| Node | Role |
-|------|------|
-| `supervisor` | Classifies intent into one or more routes + extracts ticker/quantity |
-| `stock_fetcher` → `risk_calculator` | Stock Analysis Flow (price/fundamentals → risk) |
-| `news_agent` | News Analysis Flow (headlines + sentiment) |
-| `trader` | Emits a `purchase_stock` **tool call** |
-| `trade_tools` | **Prebuilt `ToolNode`** — executes the tool (HITL `interrupt`) |
-| `trade_collect` | Lifts the `ToolMessage` result back into typed state |
-| `processing` → `state_updater` | Aggregate flow outputs + dedupe tool history |
-| `response_synthesizer` | LLM (or template fallback) writes the final answer |
-| `approval_gate` | Final review checkpoint (`approve` → END, `revise` → regenerate) |
-
-### Edges, conditional routing & tool flow
-
-The graph is **not** a fixed linear pipeline — the Supervisor's decision drives
-**conditional edges** that *skip* straight to whichever workflows are actually
-needed (a deterministic `stocks → news → buy → processing` skip-chain):
-
-```text
+```
 START
-  → supervisor
-       ──cond──▶ stock_fetcher → risk_calculator        (route: "stocks")
-       ──cond──▶ news_agent                             (route: "news")
-       ──cond──▶ trader → trade_tools(ToolNode) → trade_collect   (route: "buy")
-       ──cond──▶ response_synthesizer                   (route: "chat" — no tools)
-  (active flows converge) → processing → state_updater
-       → response_synthesizer
-       → approval_gate ──approve──▶ END
-                        ──revise───▶ response_synthesizer
+  → Orchestrator (decides which sub-agents to call)
+       ──tools_condition──▶ agent_tools (ToolNode with sub-agent tools)
+       ──no tools──────────▶ synthesizer
+  (loop back to orchestrator if more tool calls)
+  → Response Synthesizer (aggregates all outputs)
+  → Approval Gate
+       ──approve──▶ END
+       ──revise───▶ Response Synthesizer
 ```
 
-This demonstrates the full required cycle: **user input → tool selection (the
-Supervisor) → conditional routing → tool execution (`ToolNode` / flow nodes) →
-results returned to state → final response generation.**
+### Key Patterns
 
-- A greeting like *"hi"* is classified as `chat` and skips **every** tool/API.
-- *"news on Tesla"* skips the stock, risk and trade nodes entirely.
-- *"buy 10 MSFT"* routes through the canonical **agent → `ToolNode`** loop, which
-  pauses for human approval.
+1. **Sub-agents as tools**: Each compiled sub-graph is wrapped with `.as_tool()` and
+   called by the orchestrator like any other tool.
 
-You can see exactly which path was taken for each turn in the **"Agent activity"**
-panel in the UI (intent, ticker, tools/APIs called, approval status).
+2. **ReAct loops**: Sub-agents use `tools_condition` to loop between their LLM and
+   ToolNode until the task is complete.
 
-## 6. Memory implementation
+3. **HITL interrupt**: The `purchase_stock` tool uses LangGraph's `interrupt()` to
+   pause for human approval before executing trades.
 
-Memory is implemented with LangGraph **checkpointing** via `SqliteSaver`
-(`marketmind/graph.py`). Each conversation is a **thread** keyed by `thread_id`.
+## 7. Memory Implementation
 
-### Graph state vs. memory
+Memory uses LangGraph **checkpointing** via `SqliteSaver`:
 
-- **Graph state** (`AgentState`) is the *working memory for a single run* — the
-  data passed between nodes as one request is processed. It is transient to that
-  invocation.
-- **Memory (checkpointing)** is the *durable persistence of that state across
-  runs*. After **every** super-step the checkpointer writes the full state to
-  SQLite under the thread's id, so the next turn resumes with the complete prior
-  state instead of starting blank.
+- Each conversation is a **thread** keyed by `thread_id`
+- Full state is checkpointed after every super-step
+- Conversations survive process restarts
+- Pending approvals can be resumed after app restart
 
-### How checkpoints persist conversations
-
-Because the entire state (including `messages`) is snapshotted per step:
-
-- Multi-turn context survives — turn 2 sees everything from turn 1.
-- A conversation **survives a process restart** (it's on disk, not in RAM).
-- A run **paused on an `interrupt`** (a pending purchase approval) is itself
-  checkpointed, so you can close the app, reopen it, pick the thread from the
-  sidebar and still approve/decline the waiting order.
-
-### How memory improves UX
-
-Users get natural follow-ups (*"and the risk?"*, *"now buy 5"*) without repeating
-context, can juggle multiple independent research threads in the sidebar, and
-never lose an in-progress approval.
-
-## 7. How to run the application
+## 8. How to Run
 
 ```bash
 # 1. Create & activate a virtual environment
@@ -160,88 +187,72 @@ python -m venv .venv
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Configure environment (optional — the app runs offline without keys)
-cp .env.example .env            # then edit .env and add your keys
+# 3. Configure environment (optional)
+cp .env.example .env            # then add your API keys
 
 # 4. Run
 python app.py
 ```
 
-Then open the local URL Gradio prints (usually `http://127.0.0.1:7860`).
+Open the local URL Gradio prints (usually `http://127.0.0.1:7860`).
 
-### Environment variables
+### Environment Variables
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `OPENAI_API_KEY` | recommended | LLM routing & synthesis (offline fallback if absent) |
+| `OPENAI_API_KEY` | recommended | LLM for all agents (offline fallback if absent) |
 | `OPENAI_MODEL` | optional | Defaults to `gpt-4o-mini` |
 | `ALPHA_VANTAGE_API_KEY` | optional | Price quotes (falls back to Yahoo Finance) |
-| `NEWS_API_KEY` | optional | Reserved for richer news (DuckDuckGo needs no key) |
+| `NEWS_API_KEY` | optional | Reserved for richer news |
 | `MARKETMIND_DB` | optional | SQLite memory file (default `marketmind.db`) |
-| `LANGSMITH_*` | optional | LangSmith tracing (see `.env.example`) |
+| `LANGSMITH_*` | optional | LangSmith tracing |
 
-## 8. Example prompts
+## 9. Example Prompts
 
-- `What's the price and risk for AAPL?` → stock + risk flow.
-- `Latest news sentiment on Tesla` → news flow only (stock/trade skipped).
-- `Price and news for MSFT` → stock + risk + news flows.
-- `Buy 10 shares of MSFT` → triggers the **Approve / Decline** panel (HITL).
-- `and what about its news?` → multi-turn follow-up using thread memory.
-- `hi, what can you do?` → `chat` route, no tools called.
+- `What's the price and risk for AAPL?` → Stock Analyst sub-agent
+- `Latest news sentiment on Tesla` → News Analyst sub-agent
+- `Price and news for MSFT` → Stock + News sub-agents (multi-agent)
+- `Buy 10 shares of MSFT` → Trade Executor (triggers approval panel)
+- `Hi, what can you do?` → Chat Assistant sub-agent
+- `and what about its news?` → multi-turn follow-up using memory
 
-## 9. Challenges faced
-
-- **Fan-in races with parallel branches.** An early design fanned out to all
-  flow nodes in parallel, but uneven branch lengths (stocks is 2 nodes, news is
-  1) caused the converging `processing` node to fire early/twice. Solved with a
-  **deterministic conditional skip-chain** — genuine conditional routing that
-  still skips unneeded nodes, but with a single, predictable convergence point.
-- **Human-in-the-loop through a `ToolNode`.** Combining LangGraph's `interrupt`
-  with the prebuilt `ToolNode` required driving the tool call over a **dedicated
-  `trade_messages` channel** so the internal tool-call/result messages never
-  leaked into the user-facing chat or the token stream.
-- **Streaming the right tokens.** Gradio streaming used `stream_mode="messages"`
-  and had to be filtered to the `response_synthesizer` node so the Supervisor's
-  internal routing tokens never appeared in the chat.
-- **Graceful offline mode.** Every LLM and API path needed a deterministic
-  fallback (keyword routing, template synthesis, secondary data provider) so the
-  app remains fully runnable and demoable without any API keys.
-- **Runtime theme switching in Gradio**, which bakes themes at build time —
-  worked around by injecting each theme's CSS variables via a `<style>` block.
-
-## 10. Future improvements
-
-- A full **ReAct tool-calling loop** (`bind_tools` + `tools_condition`) for the
-  stock/news flows so the LLM, not the supervisor, chooses tools turn-by-turn.
-- **RAG** over uploaded earnings reports / 10-K PDFs as an additional tool.
-- Portfolio-level analytics and watch-lists persisted per user.
-- **Deployment to Hugging Face Spaces** with a hosted SQLite/Postgres backend.
-- Richer news via a dedicated provider (NewsAPI/Tavily) and ML-based sentiment.
-- Automated tests + CI around the routing and HITL logic.
-
----
-
-## Architecture
-
-See [`financial_research_agent_langgraph.svg`](financial_research_agent_langgraph.svg)
-for the full workflow diagram (User → Gradio → LangGraph state/nodes/ToolNode →
-APIs → SQLite memory → final response).
-
-### Project layout
+## 10. Project Layout
 
 | Path | Responsibility |
 |------|----------------|
 | `marketmind/config.py` | Environment / `.env` configuration |
-| `marketmind/state.py` | `AgentState` shared graph state (+ private trade channel) |
+| `marketmind/state.py` | `AgentState` + typed result schemas |
 | `marketmind/tools.py` | Stock, FX, risk, news and purchase tools |
-| `marketmind/agents.py` | Graph nodes + conditional-routing functions |
-| `marketmind/graph.py` | Graph wiring, `ToolNode`, SQLite checkpointer |
-| `app.py` | Gradio frontend (chat, threads, approval panel, activity panel) |
+| `marketmind/agents.py` | Entity extraction helpers |
+| `marketmind/graph.py` | Multi-agent graph: sub-agents, orchestrator, synthesizer |
+| `app.py` | Gradio frontend (chat, threads, approval panel) |
+
+## 11. Challenges & Solutions
+
+- **Sub-agent composition**: Used `graph.as_tool()` to wrap compiled sub-graphs as
+  callable tools for the orchestrator.
+
+- **Graceful offline mode**: Every LLM and API path has a deterministic fallback
+  (keyword routing, template synthesis, secondary providers).
+
+- **HITL through ToolNode**: The trade sub-agent's `purchase_stock` tool uses
+  `interrupt()` which pauses the entire graph for human approval.
+
+- **State isolation**: Each sub-agent uses `SubAgentState` (just messages) while
+  the main graph uses the full `AgentState` with typed result schemas.
+
+## 12. Future Improvements
+
+- **Parallel sub-agent execution**: Call multiple sub-agents concurrently
+- **RAG**: Upload earnings reports / 10-K PDFs as context
+- **Portfolio tracking**: Persist holdings and watch-lists per user
+- **Richer news**: NewsAPI/Tavily integration with ML-based sentiment
+- **Streaming**: Stream sub-agent outputs as they complete
 
 ---
 
-## Notes & disclaimer
+## Notes & Disclaimer
 
-- Trades are **simulated**; no real orders are placed.
-- Market data depends on third-party providers and may be delayed.
-- For research/educational purposes only — **not financial advice**.
+- Trades are **simulated**; no real orders are placed
+- Market data depends on third-party providers and may be delayed
+- For research/educational purposes only — **not financial advice**
